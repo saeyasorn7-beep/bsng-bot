@@ -2,10 +2,11 @@ const express = require('express');
 const crypto = require('crypto');
 
 const app = express();
+app.use(express.json());
 
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
-const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || '';
+const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || '';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 
 let stockData = [
   { id: "PD-120001A", name: "Fiber", unit: "ห่อ", stock: { "คลังหลัก": -17, "คลังสาขา 1": 0, "คลังสาขา 2": 0 } },
@@ -17,17 +18,6 @@ let stockData = [
   { id: "PD-500001A", name: "ASTA PLUS", unit: "กระปุก", stock: { "คลังหลัก": 97, "คลังสาขา 1": 0, "คลังสาขา 2": 0 } },
   { id: "PD-100001A", name: "Birdnest Collagen", unit: "กระปุก", stock: { "คลังหลัก": 117, "คลังสาขา 1": 0, "คลังสาขา 2": 0 } },
 ];
-
-// Keep raw body for signature verification
-app.use((req, res, next) => {
-  let data = '';
-  req.on('data', chunk => data += chunk);
-  req.on('end', () => {
-    req.rawBody = data;
-    try { req.body = JSON.parse(data); } catch(e) { req.body = {}; }
-    next();
-  });
-});
 
 async function replyMessage(replyToken, text) {
   const fetch = (await import('node-fetch')).default;
@@ -62,7 +52,7 @@ async function analyzeWithClaude(userMessage) {
     body: JSON.stringify({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 500,
-      system: `คุณคือ AI จัดการสต็อก BSNG ตอบ JSON เท่านั้น:
+      system: `คุณคือ AI จัดการสต็อก BSNG ตอบ JSON เท่านั้น ห้ามมี text อื่น:
 {"action":"check_stock"|"add_stock"|"remove_stock"|"cancel_order"|"chat","product":"ชื่อสินค้าหรือnull","quantity":จำนวนหรือnull,"warehouse":"คลังหลัก","reply":"ข้อความตอบภาษาไทย"}
 สต็อก:\n${stockSummary}`,
       messages: [{ role: 'user', content: userMessage }]
@@ -96,23 +86,12 @@ app.get('/', (req, res) => {
   res.json({ status: 'BSNG Stock Bot running ✅' });
 });
 
-app.post('/webhook', async (req, res) => {
-  // Verify LINE signature
-  const signature = req.headers['x-line-signature'];
-  if (LINE_CHANNEL_SECRET && signature) {
-    const hash = crypto.createHmac('SHA256', LINE_CHANNEL_SECRET)
-      .update(req.rawBody).digest('base64');
-    if (hash !== signature) {
-      return res.status(403).send('Invalid signature');
-    }
-  }
-
-  // Must respond 200 immediately
+app.post('/webhook', (req, res) => {
   res.status(200).send('OK');
 
   const events = req.body.events || [];
-  for (const event of events) {
-    if (event.type !== 'message' || event.message.type !== 'text') continue;
+  events.forEach(async (event) => {
+    if (event.type !== 'message' || event.message.type !== 'text') return;
     const userMessage = event.message.text;
     const replyToken = event.replyToken;
 
@@ -126,31 +105,8 @@ app.post('/webhook', async (req, res) => {
         await replyMessage(replyToken, 'ขอโทษครับ ระบบขัดข้อง กรุณาลองใหม่อีกครั้ง 🙏');
       } catch(e) {}
     }
-  }
+  });
 });
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-  const body = JSON.parse(rawBody.toString());
-  const events = body.events || [];
-
-  for (const event of events) {
-    if (event.type !== 'message' || event.message.type !== 'text') continue;
-    const userMessage = event.message.text;
-    const replyToken = event.replyToken;
-
-    try {
-      const result = await analyzeWithClaude(userMessage);
-      const replyText = processAction(result);
-      await replyMessage(replyToken, replyText);
-    } catch (err) {
-      console.error('Error:', err);
-      await replyMessage(replyToken, 'ขอโทษครับ ระบบขัดข้อง กรุณาลองใหม่อีกครั้ง 🙏');
-    }
-  }
-});
-
-app.get('/', (req, res) => res.json({ status: 'BSNG Stock Bot running ✅' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
