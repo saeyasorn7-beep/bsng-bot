@@ -2,13 +2,11 @@ const express = require('express');
 const crypto = require('crypto');
 
 const app = express();
-app.use(express.json());
 
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
-// ข้อมูลสต็อก (ใช้ Memory ก่อน)
 let stockData = [
   { id: "PD-120001A", name: "Fiber", unit: "ห่อ", stock: { "คลังหลัก": -17, "คลังสาขา 1": 0, "คลังสาขา 2": 0 } },
   { id: "PD-600002A", name: "Body Sunscreen", unit: "ชิ้น", stock: { "คลังหลัก": 8, "คลังสาขา 1": 0, "คลังสาขา 2": 0 } },
@@ -20,14 +18,17 @@ let stockData = [
   { id: "PD-100001A", name: "Birdnest Collagen", unit: "กระปุก", stock: { "คลังหลัก": 117, "คลังสาขา 1": 0, "คลังสาขา 2": 0 } },
 ];
 
-// ตรวจสอบ Signature จาก LINE
-function verifySignature(rawBody, signature) {
-  const hash = crypto.createHmac('SHA256', LINE_CHANNEL_SECRET)
-    .update(rawBody).digest('base64');
-  return hash === signature;
-}
+// Keep raw body for signature verification
+app.use((req, res, next) => {
+  let data = '';
+  req.on('data', chunk => data += chunk);
+  req.on('end', () => {
+    req.rawBody = data;
+    try { req.body = JSON.parse(data); } catch(e) { req.body = {}; }
+    next();
+  });
+});
 
-// ส่งข้อความกลับ LINE
 async function replyMessage(replyToken, text) {
   const fetch = (await import('node-fetch')).default;
   await fetch('https://api.line.me/v2/bot/message/reply', {
@@ -43,7 +44,6 @@ async function replyMessage(replyToken, text) {
   });
 }
 
-// วิเคราะห์ข้อความด้วย Claude
 async function analyzeWithClaude(userMessage) {
   const fetch = (await import('node-fetch')).default;
   const stockSummary = stockData.map(p => {
@@ -62,11 +62,9 @@ async function analyzeWithClaude(userMessage) {
     body: JSON.stringify({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 500,
-      system: `คุณคือ AI จัดการสต็อก BSNG ตอบ JSON เท่านั้น ห้ามมี text อื่น:
+      system: `คุณคือ AI จัดการสต็อก BSNG ตอบ JSON เท่านั้น:
 {"action":"check_stock"|"add_stock"|"remove_stock"|"cancel_order"|"chat","product":"ชื่อสินค้าหรือnull","quantity":จำนวนหรือnull,"warehouse":"คลังหลัก","reply":"ข้อความตอบภาษาไทย"}
-
-สต็อกปัจจุบัน:
-${stockSummary}`,
+สต็อก:\n${stockSummary}`,
       messages: [{ role: 'user', content: userMessage }]
     })
   });
@@ -76,7 +74,6 @@ ${stockSummary}`,
   return JSON.parse(text);
 }
 
-// ประมวลผลคำสั่ง
 function processAction(result) {
   const { action, product, quantity, warehouse } = result;
   if (action === 'check_stock' || action === 'chat') return result.reply;
@@ -84,27 +81,56 @@ function processAction(result) {
   const found = stockData.find(p =>
     p.name.toLowerCase().includes((product || '').toLowerCase())
   );
-  if (!found) return `ไม่พบสินค้า "${product}" ในระบบครับ`;
+  if (!found) return `ไม่พบสินค้า "${product}" ครับ`;
 
   const w = warehouse || 'คลังหลัก';
   const delta = action === 'add_stock' || action === 'cancel_order' ? quantity : -quantity;
   found.stock[w] = (found.stock[w] || 0) + delta;
 
   const icon = action === 'add_stock' ? '➕' : action === 'remove_stock' ? '➖' : '↩️';
-  return `${icon} ${action === 'add_stock' ? 'เติมสต็อก' : action === 'remove_stock' ? 'ตัดสต็อก' : 'คืนสต็อก'} ${found.name} ${Math.abs(delta)} ${found.unit}\n📦 ${w} คงเหลือ: ${found.stock[w]} ${found.unit}`;
+  const label = action === 'add_stock' ? 'เติมสต็อก' : action === 'remove_stock' ? 'ตัดสต็อก' : 'คืนสต็อก';
+  return `${icon} ${label} ${found.name} ${Math.abs(delta)} ${found.unit}\n📦 ${w} คงเหลือ: ${found.stock[w]} ${found.unit}`;
 }
 
-// Webhook รับข้อความจาก LINE
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  const signature = req.headers['x-line-signature'];
-  const rawBody = req.body;
+app.get('/', (req, res) => {
+  res.json({ status: 'BSNG Stock Bot running ✅' });
+});
 
-  if (!verifySignature(rawBody, signature)) {
-    return res.status(403).send('Invalid signature');
+app.post('/webhook', async (req, res) => {
+  // Verify LINE signature
+  const signature = req.headers['x-line-signature'];
+  if (LINE_CHANNEL_SECRET && signature) {
+    const hash = crypto.createHmac('SHA256', LINE_CHANNEL_SECRET)
+      .update(req.rawBody).digest('base64');
+    if (hash !== signature) {
+      return res.status(403).send('Invalid signature');
+    }
   }
 
+  // Must respond 200 immediately
   res.status(200).send('OK');
 
+  const events = req.body.events || [];
+  for (const event of events) {
+    if (event.type !== 'message' || event.message.type !== 'text') continue;
+    const userMessage = event.message.text;
+    const replyToken = event.replyToken;
+
+    try {
+      const result = await analyzeWithClaude(userMessage);
+      const replyText = processAction(result);
+      await replyMessage(replyToken, replyText);
+    } catch (err) {
+      console.error('Error:', err);
+      try {
+        await replyMessage(replyToken, 'ขอโทษครับ ระบบขัดข้อง กรุณาลองใหม่อีกครั้ง 🙏');
+      } catch(e) {}
+    }
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
   const body = JSON.parse(rawBody.toString());
   const events = body.events || [];
 
